@@ -1,160 +1,209 @@
+import pandas as pd
 import numpy as np
-import pinecone
-from sentence_transformers import SentenceTransformer
+import os
 from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+import openai
+import cohere
+import genai
+
+# Initialize SentenceTransformer model for embeddings
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Initialize Cohere client (replace 'your-api-key' with an actual API key)
+co = cohere.Client('your-api-key')
+
+# Initialize GenAI model
+genai_client = genai.GenerativeModel("gemini-1.5-flash")
 
 
-# Initialize Pinecone and create/connect to an index
-def initialize_pinecone(api_key, index_name, environment='us-east-1'):
-    # Initialize Pinecone
-    pinecone.init(api_key=api_key, environment=environment)
-
-    # Check if the index exists and create it if it does not
-    if index_name not in pinecone.list_indexes():
-        pinecone.create_index(
-            name=index_name,
-            dimension=384,  # Ensure this matches your embedding dimension
-            metric='cosine'
-        )
-
-    # Connect to the existing or newly created index
-    index = pinecone.Index(index_name)
-    return index
+# Function to encode text using SentenceTransformer
+def encode_text(text):
+    embeddings = model.encode(text)
+    return embeddings
 
 
-def load_models():
-    full_model = SentenceTransformer('bert-base-uncased')
-    mini_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-    return full_model, mini_model
+# Function to call OpenAI GPT API
+def call_gpt_api(query, abstract):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a relevance evaluator for scientific articles. Reply with only a "
+                                          "single number between 1 and 10."},
+            {"role": "user", "content": f"Question: {query}\nArticle Abstract: {abstract}\nRate the relevance from 1 "
+                                        f"to 10. Only provide the number as an answer."}
+        ]
+    )
+    score_text = response['choices'][0]['message']['content']
+    return float(score_text.strip())
 
 
-# Create category embeddings
-def create_category_embeddings(model, category_dict):
-    category_embedding_dict = {}
-    for code, name in category_dict.items():
-        embedding = model.encode(name)
-        category_embedding_dict[code] = {
-            'name': name,
-            'embedding': embedding
-        }
-    return category_embedding_dict
+# Function to call Cohere API
+def call_cohere_api(query, abstract):
+    response = co.generate(
+        model="command-xlarge-nightly",
+        prompt=f"You are a relevance evaluator for scientific articles. Question: {query}\nArticle Abstract: {abstract}\nRate the relevance from 1 to 10. Only provide the number as an answer.",
+        max_tokens=10
+    )
+    return float(response.generations[0].text.strip())
 
 
-# Upsert document embeddings into Pinecone
-def upsert_document_embeddings(index, document_embedding_dict, batch_size=100):
-    embeddings_batch = []
-    for i, (doc_id, data) in enumerate(document_embedding_dict.items()):
-        embedding = data['embedding']
-        metadata = {
-            'categories': data['categories'],
-            'update_date': str(data['update_date']),
-            'title': data.get('title', ''),
-            'abstract': data.get('abstract', '')
-        }
-        embeddings_batch.append((doc_id, embedding.tolist(), metadata))
-
-        if (i + 1) % batch_size == 0 or i == len(document_embedding_dict) - 1:
-            index.upsert(embeddings_batch)
-            embeddings_batch = []
+# Function to call Gemini API
+def call_gemini_api(query, abstract):
+    prompt_text = f"You are a relevance evaluator for scientific articles. Question: {query}\nArticle Abstract: {abstract}\nRate the relevance from 1 to 10. Only provide the number as an answer."
+    response = genai_client.generate_content(prompt_text)
+    return float(response.text)
 
 
-# Query handling and category-aware retrieval
-def find_top_categories(query, full_model, category_embedding_dict):
-    query_embedding_full = full_model.encode(query)
-    category_embeddings = np.array([data['embedding'] for data in category_embedding_dict.values()])
-    category_codes = list(category_embedding_dict.keys())
-    similarities = cosine_similarity([query_embedding_full], category_embeddings)[0]
-    top_3_indices = similarities.argsort()[-3:][::-1]
-    top_3_categories = [category_codes[i] for i in top_3_indices]
-    return top_3_categories
+# Function to retrieve articles from Pinecone
+def retrieve_articles(query, top_k=5):
+    query_embedding = encode_text(query)
+    response = index.query(vector=query_embedding.tolist(), top_k=top_k, include_metadata=True, include_values=True)
+    articles = [(match['metadata']['title'], match['metadata']['abstract']) for match in response['matches']]
+    return articles
 
 
-def retrieve_documents(index, query_embedding, top_3_categories):
-    filtered_documents = []
-    for category in top_3_categories:
-        # Query the index with a filter for the specific category
-        query_result = index.query(
-            vector=query_embedding.tolist(),
-            top_k=5,
-            include_values=True,
-            include_metadata=True,
-            filter={"categories": {"$in": [category]}}  # Filter to include only documents in the current category
-        )
-        if 'matches' in query_result and len(query_result['matches']) > 0:
-            filtered_documents.extend(query_result['matches'])
-    return filtered_documents
+# Function to evaluate articles using GPT, Cohere, and Gemini
+def evaluate_articles(query, articles):
+    gpt_scores, cohere_scores, gemini_scores = [], [], []
+    for title, abstract in articles:
+        combined_text = f"Title: {title}\nAbstract: {abstract}"
+
+        # OpenAI GPT Score
+        gpt_score = call_gpt_api(query, combined_text)
+        gpt_scores.append(gpt_score)
+
+        # Cohere Score
+        cohere_score = call_cohere_api(query, combined_text)
+        cohere_scores.append(cohere_score)
+
+        # Gemini Score
+        gemini_score = call_gemini_api(query, combined_text)
+        gemini_scores.append(gemini_score)
+
+    avg_scores = [(g + c + a) / 3 for g, c, a in zip(gpt_scores, cohere_scores, gemini_scores)]
+    return avg_scores
 
 
-def get_top_unique_documents(filtered_documents):
-    if len(filtered_documents) > 0:
-        sorted_documents = sorted(filtered_documents, key=lambda x: x['score'], reverse=True)
-        unique_docs = []
-        seen_doc_ids = set()
-
-        for match in sorted_documents:
-            doc_id = match['id']
-            if doc_id not in seen_doc_ids:
-                unique_docs.append(match)
-                seen_doc_ids.add(doc_id)
-            if len(unique_docs) == 5:
-                break
-
-        return unique_docs
-    else:
-        return []
+# Function to expand the query using GPT
+def expand_query(query):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are an expert in data science and information retrieval."},
+            {"role": "user",
+             "content": f"Provide additional keywords or phrases that could be incorporated into the following query to refine or broaden it, but do not answer the question. Return a concise list of relevant terms or phrases only. Query: '{query}'"}
+        ]
+    )
+    expanded_terms = response['choices'][0]['message']['content'].strip()
+    expanded_query = f"{query} {expanded_terms}"
+    return expanded_query
 
 
-def display_documents(unique_docs):
-    if unique_docs:
-        print("Top 5 most relevant unique documents:")
-        for match in unique_docs:
-            doc_id = match['id']
-            metadata = match.get('metadata', {})
-            title = metadata.get('title', 'No title available')
-            abstract = metadata.get('abstract', 'No abstract available')
-            score = match.get('score', 'No score available')
-            print(f"Document ID: {doc_id}\nTitle: {title}\nAbstract: {abstract}\nScore: {score}\n")
-    else:
-        print("No relevant documents found.")
+# Function to calculate cosine similarity
+def calculate_cosine_similarity(query_embedding, abstract_embedding):
+    return cosine_similarity([query_embedding], [abstract_embedding])[0][0]
 
 
-def main():
+# Function to test query expansion
+def test_query_expansion(questions, top_k=5):
+    global results_df
 
-    pinecone.init(api_key="65adfe61-8c99-4c68-951e-e2d42e7884df", environment="us-east-1")
-    index = pinecone.Index("document-embeddings")
+    for query in questions:
+        # Original query retrieval and scoring
+        print(f"Running retrieval for original query: {query}")
+        original_articles = retrieve_articles(query, top_k)
+        original_scores = evaluate_articles(query, original_articles)
+        avg_original_score = np.mean(original_scores)
+        query_embedding = encode_text(query)
 
-    # load BERT models
-    full_model, mini_model = load_models()
+        # Expanded query retrieval and scoring
+        expanded_query = expand_query(query)
+        expanded_articles = retrieve_articles(expanded_query, top_k)
+        expanded_scores = evaluate_articles(query, expanded_articles)
+        avg_expanded_score = np.mean(expanded_scores)
 
-    # Create category embeddings
-    category_dict = {
-        'cs.AI': 'Artificial Intelligence',
-        'cs.LG': 'Machine Learning',
-        'cs.CL': 'Computation and Language',
-        'cs.CV': 'Computer Vision and Pattern Recognition',
-        'stat.ML': 'Machine Learning',
-        'cs.NE': 'Neural and Evolutionary Computing',
-        'eess.AS': 'Audio and Speech Processing',
-        'stat.TH': 'Statistics Theory'
-    }
-    category_embedding_dict = create_category_embeddings(full_model, category_dict)
+        # Track seen titles to manage overlaps and label source query
+        original_titles = {title for title, _ in original_articles}
+        all_articles = {}
 
-    # Query handling and retrieval
-    query = "deep learning"
-    query_embedding = mini_model.encode(query)
-    top_3_categories = find_top_categories(query, full_model, category_embedding_dict)
+        # Process original query articles
+        for i, (title, abstract) in enumerate(original_articles):
+            abstract_embedding = encode_text(abstract)
+            cosine_sim = calculate_cosine_similarity(query_embedding, abstract_embedding)
+            all_articles[title] = {
+                "query": query,
+                "expanded_query": expanded_query,
+                "title": title,
+                "abstract": abstract,
+                "model_score": original_scores[i],
+                "cosine_similarity": cosine_sim,
+                "source_query": "original",
+            }
 
-    print("Top 3 categories for the query:")
-    for category_code in top_3_categories:
-        print(f"{category_code} : {category_dict[category_code]}")
+        # Process expanded query articles, check for overlap
+        for i, (title, abstract) in enumerate(expanded_articles):
+            abstract_embedding = encode_text(abstract)
+            cosine_sim = calculate_cosine_similarity(query_embedding, abstract_embedding)
+            if title in all_articles:
+                all_articles[title]["source_query"] = "overlap"
+            else:
+                all_articles[title] = {
+                    "query": query,
+                    "expanded_query": expanded_query,
+                    "title": title,
+                    "abstract": abstract,
+                    "model_score": expanded_scores[i],
+                    "cosine_similarity": cosine_sim,
+                    "source_query": "expanded",
+                }
 
-    # Step 4: Retrieve relevant documents
-    filtered_documents = retrieve_documents(index, query_embedding, top_3_categories)
-    unique_docs = get_top_unique_documents(filtered_documents)
+        # Add results to DataFrame
+        for article_data in all_articles.values():
+            new_row = pd.DataFrame([article_data])
+            results_df = pd.concat([results_df, new_row], ignore_index=True)
 
-    # Step 5: Display results
-    display_documents(unique_docs)
+        # Calculate overlap count
+        overlap_count = sum(1 for article in all_articles.values() if article["source_query"] == "overlap")
+
+        # Save intermediate results to the CSV file
+        results_df.to_csv(csv_file, index=False)
+        print(f"Results saved to CSV after query: {query}")
+
+    return results_df
 
 
-if __name__ == "__main__":
-    main()
+# Function to get the top 5 articles based on model score, combining original and expanded queries
+def get_top_5_articles(query, index, top_k=5):
+    # Retrieve articles and scores for the original query
+    original_articles = retrieve_articles(query, top_k)
+    original_scores = evaluate_articles(query, original_articles)
+
+    # Retrieve articles and scores for the expanded query
+    expanded_query = expand_query(query)
+    expanded_articles = retrieve_articles(expanded_query, top_k)
+    expanded_scores = evaluate_articles(query, expanded_articles)
+
+    # Combine results from original and expanded queries
+    combined_articles = []
+    for i, (title, abstract) in enumerate(original_articles):
+        combined_articles.append({
+            "title": title,
+            "abstract": abstract,
+            "model_score": original_scores[i],
+            "source_query": "original"
+        })
+
+    for i, (title, abstract) in enumerate(expanded_articles):
+        # Avoid duplicates
+        if title not in [article["title"] for article in combined_articles]:
+            combined_articles.append({
+                "title": title,
+                "abstract": abstract,
+                "model_score": expanded_scores[i],
+                "source_query": "expanded"
+            })
+
+    # Sort combined articles by model score and select the top 5
+    top_5_articles = sorted(combined_articles, key=lambda x: x["model_score"], reverse=True)[:5]
+    return top_5_articles
