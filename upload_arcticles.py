@@ -122,3 +122,7 @@ if __name__ == "__main__":
     similar_articles = find_similar_articles(user_input)
     print(similar_articles[0])
 
+    user_input = "embeddings in computer vision"
+    similar_articles = find_similar_articles(user_input)
+    print(similar_articles[0])
+
